@@ -1,0 +1,17 @@
+config {
+
+  type: "view",
+
+  name: "age_groups"
+
+}
+
+SELECT
+
+  FLOOR(age / 5) * 5 AS age_group,
+
+  COUNT(1) AS user_count
+
+FROM dwd_dim_vehicles
+
+GROUP BY age_group

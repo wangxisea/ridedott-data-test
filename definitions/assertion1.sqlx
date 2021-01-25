@@ -1,0 +1,420 @@
+-- select * from user_xi.dwd_fact_rider_payment_events where time_updated is not null;
+-- create or replace table user_xi.dwd_fact_rider_payment_events as
+insert into
+  user_xi.dwd_fact_rider_payment_events with rides AS (
+    SELECT
+      ride_id,
+      time_ride_start_local,
+      time_ride_end_local,
+      city_id AS city_id_ride,
+      city_name AS city_name_ride,
+      market_id AS market_id_ride,
+      market_name AS market_name_ride,
+      country_id AS country_id_ride,
+      country_name AS country_name_ride
+      --       , distance_geo_track
+      --       , TIMESTAMP_DIFF(time_ride_end_local, time_ride_start_local, SECOND)      AS duration_second
+,
+      charge_cancellation_reason,
+      amount_net_booking_eur,
+      amount_net_booking_local
+    FROM
+      bi_marts.dwd_fact_rides_end_local_time
+    WHERE
+      time_ride_end_local BETWEEN TIMESTAMP('2020-9-15')
+      AND TIMESTAMP('2021-1-5')
+  ),
+  exchange_rates_eur AS (
+    SELECT
+      *
+    FROM
+      odl.dwd_fact_exchange_rates
+    WHERE
+      from_currency = 'EUR'
+  ),
+  dim_products AS (
+    SELECT
+      distinct product_id,
+      type AS product_type
+    FROM
+      odl.dwd_dim_products
+  ),
+  payment_methods AS (
+    SELECT
+      DISTINCT *
+    FROM
+      user_xi.dwd_dim_rider_payment_methods
+    ORDER BY
+      1 DESC
+  ),
+  adyen as (
+    select
+      Merchant_Reference as external_id,
+      TIMESTAMP(
+        DATETIME(
+          Booking_Date,
+          IF(
+            TimeZone = "CEST",
+            "CET",
+            TimeZone
+          )
+        )
+      ) as time_update_local,
+      concat(Payable_Batch) as payable_batch_number,
+      COALESCE(pay_status.payment_status, adyen.record_type) as event_type,
+      pay_name.payment_method_name_display as payment_method_name,
+      Acquirer as acquirer_name,
+      CAST(MID AS string) as acquirer_mid,
+      Payment_Currency as currency,
+      case
+        when Record_Type in (
+          'Received',
+          'Refused',
+          'Error'
+        ) then Received__PC_ * 100
+        when Record_Type in ('Authorised', 'Cancelled') then Authorised__PC_ * 100
+        when Record_Type in ('SentForSettle', 'Chargeback') then Captured__PC_ * 100
+      end as gross_amount_cent_local,
+      Payable__SC_ * 100 as net_amount_cent_local
+      -- payment fees
+,
+      Settlement_Currency as fee_currency,
+      case
+        when Record_type not in ('SentForSettle', 'SentForRefund') then abs(Commission__SC_ * 100)
+      end as acquirer_blend_fee_cent_local,
+      case
+        when Record_type not in ('SentForSettle', 'SentForRefund') then abs(Markup__SC_ * 100)
+      end as acquirer_markup_fee_cent_local,
+      case
+        when Record_type not in ('SentForSettle', 'SentForRefund') then abs(Scheme_Fees__SC_ * 100)
+      end as scheme_fee_cent_local,
+      case
+        when Record_type not in ('SentForSettle', 'SentForRefund') then abs(Interchange__SC_ * 100)
+      end as interchange_fee_cent_local,
+      Processing_Fee_Currency as gateway_fee_currency,
+      abs(Processing_Fee__FC_ * 100) as gateway_fee_cent_local
+      -- the fee is actually 0.025 but Adyen rounds it (but charges the full amount on invoice)
+,
+      'EUR' as risk_fee_currency,
+      (
+        case
+          when Risk_Premium = true then 1.0
+        end
+      ) as risk_fee_cent_local
+    from
+      `user_xi.adyen_payments_accounting_*` adyen
+      left join odl.dwd_ref_rider_payment_status pay_status on pay_status.adyen_payments_status = adyen.record_type
+      left join odl.dwd_ref_rider_payment_method_names pay_name on pay_name.payment_method_name_adyen = adyen.Payment_Method
+    where
+      1 = 1
+      --       and Merchant_Reference in ('iv_1IqGMMNw5cnV8WAHBe3Oxh5GRIkFDeYw','iv_005jkttaWEMvI2mhgAWqEMvBFWDarTg4','iv_oxZTNECeaG0R8wdAVcnQIbmnp2ZFpJPa','iv_GulBy5YXo1lODVfD16nho5C43MdIIa6i','iv_PdkbDiB0PmTN1DqpNB0nDzLKMRsC6anj')
+  ),
+  payment_intention_base as (
+    select
+      payment_intention_id,
+      external_id,
+      time_updated,
+      time_creation,
+      amount_requested as amount_requested_cent_local,
+      currency As payment_currency,
+      COALESCE(
+        payment_method_id_prepaid,
+        payment_method_id_postpaid
+      ) AS payment_method_id,
+      ride_id,
+      rider_id,
+      wallet_id,
+      product_id,
+      payment_processor_customer_3ds.status AS payment_processor_customer_3ds_status,
+      payment_processor_error_code,
+      payment_processor_gateway_name,
+      status,
+      type AS order_type,
+      lag(status) over (
+        partition by payment_intention_id
+        order by
+          time_updated
+      ) as previous_status,
+      rank() over (
+        partition by payment_intention_id,
+        status
+        order by
+          time_updated desc
+      ) as rn
+    from
+      `rdl.dwr_rider_payment_intentions`
+    where
+      1 = 1
+      and date(time_updated) IN (
+        '2021-1-4',
+        '2020-10-22',
+        '2020-10-21',
+        '2020-10-20',
+        '2020-9-22',
+        '2020-9-20',
+        '2020-9-29'
+      )
+      --     and external_id in ('iv_1IqGMMNw5cnV8WAHBe3Oxh5GRIkFDeYw','iv_005jkttaWEMvI2mhgAWqEMvBFWDarTg4','iv_oxZTNECeaG0R8wdAVcnQIbmnp2ZFpJPa','iv_GulBy5YXo1lODVfD16nho5C43MdIIa6i','iv_PdkbDiB0PmTN1DqpNB0nDzLKMRsC6anj')
+  ),
+  payment_intention_curated as (
+    select
+      *
+    except
+      (status, previous_status, rn),
+      status
+    from
+      payment_intention_base
+    where
+      payment_intention_base.rn = 1
+    union all
+      -- create synthetic 'authorized' event if transition is initialized->captured
+    select
+      *
+    except
+      (status, previous_status, rn),
+      'authorized' as status
+    from
+      payment_intention_base
+    where
+      status = 'captured'
+      and previous_status = 'initialized'
+      and payment_intention_base.rn = 1
+  ),
+  combo as (
+    select
+      payment_intention_curated.payment_intention_id,
+      payment_intention_curated.external_id,
+      payment_intention_curated.time_creation,
+      payment_intention_curated.time_updated,
+      payment_intention_curated.status as event_type,
+      payment_intention_curated.amount_requested_cent_local,
+      payment_intention_curated.payment_currency,
+      payment_intention_curated.payment_method_id,
+      payment_intention_curated.ride_id,
+      payment_intention_curated.rider_id,
+      payment_intention_curated.wallet_id,
+      payment_intention_curated.product_id,
+      payment_intention_curated.order_type,
+      payment_intention_curated.payment_processor_customer_3ds_status,
+      payment_intention_curated.payment_processor_error_code,
+      payment_intention_curated.payment_processor_gateway_name,
+      adyen.acquirer_name,
+      adyen.acquirer_mid,
+      adyen.payable_batch_number,
+      adyen.gross_amount_cent_local,
+      adyen.net_amount_cent_local,
+      adyen.gateway_fee_cent_local,
+      adyen.interchange_fee_cent_local,
+      adyen.scheme_fee_cent_local,
+      adyen.acquirer_blend_fee_cent_local,
+      adyen.acquirer_markup_fee_cent_local,
+      adyen.risk_fee_cent_local,
+      adyen.fee_currency,
+      adyen.gateway_fee_currency,
+      adyen.risk_fee_currency
+    from
+      payment_intention_curated
+      left outer join adyen on (
+        payment_intention_curated.external_id = adyen.external_id
+        and payment_intention_curated.status = adyen.event_type
+      )
+    union all
+    select
+      payment_intention_curated.payment_intention_id,
+      payment_intention_curated.external_id,
+      payment_intention_curated.time_creation,
+      payment_intention_curated.time_updated,
+      payment_intention_curated.status as event_type,
+      payment_intention_curated.amount_requested_cent_local,
+      payment_intention_curated.payment_currency,
+      payment_intention_curated.payment_method_id,
+      payment_intention_curated.ride_id,
+      payment_intention_curated.rider_id,
+      payment_intention_curated.wallet_id,
+      payment_intention_curated.product_id,
+      payment_intention_curated.order_type,
+      payment_intention_curated.payment_processor_customer_3ds_status,
+      payment_intention_curated.payment_processor_error_code,
+      payment_intention_curated.payment_processor_gateway_name,
+      adyen.acquirer_name,
+      adyen.acquirer_mid,
+      adyen.payable_batch_number,
+      case
+        when event_type = 'settled' then round(
+          net_amount_cent_local + interchange_fee_cent_local + scheme_fee_cent_local + acquirer_blend_fee_cent_local + acquirer_markup_fee_cent_local,
+          2
+        )
+        else adyen.gross_amount_cent_local
+      end as gross_amount,
+      adyen.net_amount_cent_local,
+      adyen.gateway_fee_cent_local,
+      adyen.interchange_fee_cent_local,
+      adyen.scheme_fee_cent_local,
+      adyen.acquirer_blend_fee_cent_local,
+      adyen.acquirer_markup_fee_cent_local,
+      adyen.risk_fee_cent_local,
+      adyen.fee_currency,
+      adyen.gateway_fee_currency,
+      adyen.risk_fee_currency
+    from
+      adyen
+      left join payment_intention_curated on (
+        adyen.external_id = payment_intention_curated.external_id
+      )
+    where
+      adyen.event_type in (
+        'dispute-defended',
+        'refunded-done',
+        'settled'
+      )
+      and case
+        when event_type = 'dispute-defended' then status = 'reversed'
+        when event_type = 'refunded-done' then status = 'refunded'
+        when event_type = 'settled' then status = 'captured'
+      end
+  ),
+  flatten_events AS (
+    select
+      combo.payment_intention_id as payment_id,
+      combo.external_id,
+      combo.time_creation,
+      combo.time_updated,
+      combo.payable_batch_number,
+      combo.event_type,
+      LAG(combo.event_type) OVER (
+        PARTITION BY combo.payment_intention_id
+        order by
+          combo.time_updated
+      ) as event_type_previous,
+      LAG(combo.time_updated) OVER (
+        PARTITION BY combo.payment_intention_id
+        order by
+          combo.time_updated
+      ) as time_update_event_type_previous,
+      COALESCE(r.country_id_ride) as country_id_service,
+      COALESCE(r.city_id_ride) as city_id_service,
+      COALESCE(r.city_name_ride) as city_name_service,
+      COALESCE(r.market_id_ride) as market_id_service,
+      COALESCE(r.market_name_ride) as market_name_service,
+      combo.order_type,
+      COALESCE(combo.ride_id, combo.payment_intention_id) as revenue_generating_activity_id,
+      combo.rider_id,
+      combo.payment_processor_gateway_name,
+      m.payment_type,
+      combo.payment_method_id,
+      m.payment_method_name_display AS payment_method_name,
+      combo.acquirer_name,
+      combo.acquirer_mid,
+      m.card_type,
+      m.card_category,
+      m.card_level,
+      m.is_premium_card,
+      m.card_bin,
+      m.country_code as card_country_code,
+      m.card_co_scheme,
+      cast(null as boolean) as has_liability_shift,
+      combo.payment_processor_error_code AS refusal_reason,
+      'to-be-define' as refusal_type,
+      if(
+        event_type IN ('fraud-notification-received', 'reversed'),
+        'fraud',
+        'other'
+      ) as refund_type,
+      combo.payment_currency,
+      combo.payment_processor_customer_3ds_status,
+      combo.amount_requested_cent_local,
+      combo.gross_amount_cent_local,
+      combo.gross_amount_cent_local / ex.ecb_exchange_rate AS gross_amount_cent_eur,
+      combo.net_amount_cent_local,
+      combo.net_amount_cent_local / ex.ecb_exchange_rate AS net_amount_cent_eur,
+      combo.gateway_fee_cent_local,
+      combo.interchange_fee_cent_local,
+      combo.scheme_fee_cent_local,
+      combo.acquirer_blend_fee_cent_local,
+      combo.acquirer_markup_fee_cent_local,
+      combo.risk_fee_cent_local,
+      combo.fee_currency,
+      combo.gateway_fee_currency,
+      combo.risk_fee_currency
+    from
+      combo
+      LEFT JOIN rides r USING(ride_id)
+      LEFT JOIN dim_products products USING(product_id)
+      LEFT JOIN payment_methods m ON combo.payment_method_id = m.payment_method_id
+      AND combo.time_updated >= m.time_is_available_from_incl
+      AND combo.time_updated < time_is_available_to_excl
+      LEFT JOIN exchange_rates_eur ex ON DATE(combo.time_updated, 'CET') = ex.date_exchange
+      AND combo.payment_currency = ex.to_currency
+  )
+SELECT
+  *
+EXCEPT(
+    gateway_fee_cent_local,
+    interchange_fee_cent_local,
+    scheme_fee_cent_local,
+    acquirer_blend_fee_cent_local,
+    acquirer_markup_fee_cent_local,
+    risk_fee_cent_local,
+    fee_currency,
+    gateway_fee_currency,
+    risk_fee_currency
+  ),
+  ARRAY_AGG(
+    STRUCT (
+      gateway_fee_cent_local,
+      interchange_fee_cent_local,
+      scheme_fee_cent_local,
+      acquirer_blend_fee_cent_local,
+      acquirer_markup_fee_cent_local,
+      risk_fee_cent_local,
+      fee_currency,
+      gateway_fee_currency,
+      risk_fee_currency
+    )
+  ) AS payment_fees
+FROM
+  flatten_events
+GROUP BY
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  24,
+  25,
+  26,
+  27,
+  28,
+  29,
+  30,
+  31,
+  32,
+  33,
+  34,
+  35,
+  36,
+  37,
+  38,
+  39,
+  40
+order by
+  external_id,
+  time_updated;
