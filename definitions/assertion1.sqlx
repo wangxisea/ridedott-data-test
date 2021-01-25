@@ -15,6 +15,7 @@ insert into
       --       , distance_geo_track
       --       , TIMESTAMP_DIFF(time_ride_end_local, time_ride_start_local, SECOND)      AS duration_second
 ,
+
       charge_cancellation_reason,
       amount_net_booking_eur,
       amount_net_booking_local
